@@ -197,12 +197,15 @@ def _replenish_pool_sync() -> None:
             break
 
         try:
+            import uuid as _uuid
+            unique_db = f"_p{_uuid.uuid4().hex[:16]}"
             success, output = _run_bench([
                 "new-site", name,
                 "--mariadb-user-host-login-scope=%",
                 "--admin-password", DEFAULT_ADMIN_PASSWORD,
                 "--db-root-username", "root",
                 "--db-root-password", MARIADB_ROOT_PASSWORD,
+                "--db-name", unique_db,
                 "--install-app", "erpnext",
             ], timeout=300)
             if success:

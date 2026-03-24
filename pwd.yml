@@ -142,7 +142,8 @@ services:
       - /home/frappe/frappe-bench/sites/site_provisioner.py
     environment:
       MARIADB_ROOT_PASSWORD: admin
-      MAX_SITES: "5"
+      MAX_SITES: "10"
+      POOL_SIZE: "5"
       PROVISIONER_PORT: "9090"
       DEFAULT_ADMIN_PASSWORD: "Admin@2026"
     volumes:
