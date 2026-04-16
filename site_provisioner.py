@@ -7,9 +7,10 @@ the ERPNext Docker backend container on port 9090. Wraps `bench new-site`
 and `bench drop-site` behind a simple JSON API.
 
 Endpoints:
-  POST /create-site   { "site_name": "abc.localhost", "admin_password": "..." }
-  POST /claim-site    { "target_name": "abc.localhost" }   ← instant (renames a pool site)
-  POST /drop-site     { "site_name": "abc.localhost" }
+  POST /create-site    { "site_name": "abc.localhost", "admin_password": "..." }
+  POST /claim-site     { "target_name": "abc.localhost" }   ← instant (renames a pool site)
+  POST /drop-site      { "site_name": "abc.localhost" }
+  POST /reset-tenant   { "tenant_name": "abc.localhost" }   ← atomic drop + claim
   GET  /list-sites
   GET  /pool-status
   GET  /health
@@ -19,12 +20,22 @@ Pre-warm pool:
   background (bench new-site). When a tenant needs a site, /claim-site
   renames a warm site instantly (~1s) instead of waiting 3 min for bench.
 
+Reset-tenant flow (for import abandon):
+  /reset-tenant drops the tenant's current site and atomically claims a fresh
+  one from the warm pool. Returns the new site details. If the pool is empty,
+  the drop is still performed and a 503 is returned so the caller can show
+  a blocking "Preparing fresh workspace…" UI while replenishment runs.
+
 Environment variables:
   MARIADB_ROOT_PASSWORD   — MariaDB root password (default: "admin")
-  MAX_SITES               — Maximum number of tenant sites allowed (default: 3)
-  POOL_SIZE               — Number of warm sites to keep ready (default: 2)
+  MAX_SITES               — Maximum number of tenant sites allowed
+                            (defaults: 3 for dev/staging, tune to 10 in prod)
+  POOL_SIZE               — Number of warm sites to keep ready
+                            (defaults: 2 for dev/staging, tune to 5 in prod)
   PROVISIONER_PORT        — Port to listen on (default: 9090)
   DEFAULT_ADMIN_PASSWORD  — Default admin password for new sites (default: "Admin@2026")
+  POOL_LOW_WARN_SECONDS   — Seconds pool can stay at 0 before log WARN
+                            (default: 60; 0 disables)
 """
 
 import json
@@ -47,10 +58,17 @@ MAX_SITES = int(os.environ.get("MAX_SITES", "3"))
 POOL_SIZE = int(os.environ.get("POOL_SIZE", "2"))
 PORT = int(os.environ.get("PROVISIONER_PORT", "9090"))
 DEFAULT_ADMIN_PASSWORD = os.environ.get("DEFAULT_ADMIN_PASSWORD", "Admin@2026")
+POOL_LOW_WARN_SECONDS = int(os.environ.get("POOL_LOW_WARN_SECONDS", "60"))
 SITES_DIR = Path("/home/frappe/frappe-bench/sites")
 
 # Lock to prevent concurrent bench operations (bench is not concurrency-safe)
 _bench_lock = threading.Lock()
+
+# Timestamp when pool first observed as empty; reset to None when pool becomes
+# non-empty. Used by the pool-health monitor to emit a single WARN per sustained
+# outage rather than spamming logs every check.
+_pool_empty_since: float | None = None
+_pool_monitor_lock = threading.Lock()
 
 # The default site created by docker-compose (should not be counted or deleted)
 DEFAULT_SITE = "frontend"
@@ -223,6 +241,75 @@ def _replenish_pool_background() -> None:
     thread.start()
 
 
+def _drop_site_now(site_name: str) -> tuple[bool, str]:
+    """Drop a site via `bench drop-site`. Returns (success, message).
+
+    Extracted from _handle_drop_site so /reset-tenant can reuse the same path
+    without duplicating validation, lock handling, and post-drop checks.
+    """
+    if site_name == DEFAULT_SITE:
+        return False, f"Cannot drop the default site '{DEFAULT_SITE}'"
+    if ".." in site_name or "/" in site_name or "\\" in site_name:
+        return False, f"Invalid site_name: {site_name}"
+
+    site_dir = SITES_DIR / site_name
+    if not site_dir.exists():
+        # Already dropped — idempotent success
+        return True, f"Site {site_name} does not exist (already dropped)"
+
+    if not _bench_lock.acquire(timeout=5):
+        return False, "Another site operation is in progress"
+
+    try:
+        success, output = _run_bench([
+            "drop-site",
+            site_name,
+            "--force",
+            "--db-root-username", "root",
+            "--db-root-password", MARIADB_ROOT_PASSWORD,
+        ], timeout=120)
+        if success:
+            return True, f"Site {site_name} dropped"
+        # Site may be gone despite non-zero exit
+        if not site_dir.exists():
+            return True, f"Site {site_name} dropped (with warnings)"
+        return False, f"bench drop-site failed: {output[-300:]}"
+    finally:
+        _bench_lock.release()
+
+
+def _check_pool_health() -> None:
+    """Log a WARN once when pool has been empty for POOL_LOW_WARN_SECONDS.
+
+    Called opportunistically from read endpoints (/health, /pool-status) and
+    after each claim. Uses a module-level timestamp so the warning fires once
+    per sustained outage rather than on every check.
+    """
+    global _pool_empty_since
+    if POOL_LOW_WARN_SECONDS <= 0:
+        return
+
+    pool = _get_pool_sites()
+    now = __import__("time").time()
+    with _pool_monitor_lock:
+        if pool:
+            _pool_empty_since = None
+            return
+        if _pool_empty_since is None:
+            _pool_empty_since = now
+            return
+        elapsed = now - _pool_empty_since
+        if elapsed >= POOL_LOW_WARN_SECONDS:
+            logger.warning(
+                "Warm pool empty for %.0fs (threshold=%ds). "
+                "Next claim will block until replenishment completes.",
+                elapsed, POOL_LOW_WARN_SECONDS,
+            )
+            # Reset so the next warning fires after another full threshold,
+            # not every poll.
+            _pool_empty_since = now
+
+
 def _run_bench(args: list[str], timeout: int = 300) -> tuple[bool, str]:
     """Run a bench command and return (success, output)."""
     cmd = ["bench"] + args
@@ -267,6 +354,7 @@ class ProvisionerHandler(BaseHTTPRequestHandler):
         if self.path == "/health":
             pool = _get_pool_sites()
             tenants = _get_tenant_sites()
+            _check_pool_health()
             self._send_json(200, {
                 "success": True,
                 "status": "healthy",
@@ -286,6 +374,7 @@ class ProvisionerHandler(BaseHTTPRequestHandler):
             })
         elif self.path == "/pool-status":
             pool = _get_pool_sites()
+            _check_pool_health()
             self._send_json(200, {
                 "success": True,
                 "pool_sites": pool,
@@ -303,6 +392,8 @@ class ProvisionerHandler(BaseHTTPRequestHandler):
             self._handle_claim_site()
         elif self.path == "/drop-site":
             self._handle_drop_site()
+        elif self.path == "/reset-tenant":
+            self._handle_reset_tenant()
         else:
             self._send_json(404, {"success": False, "error": "Not found"})
 
@@ -454,66 +545,108 @@ class ProvisionerHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"success": False, "error": "site_name is required"})
             return
 
-        # Safety: never allow dropping the default site
-        if site_name == DEFAULT_SITE:
+        # Safety gates are centralized in _drop_site_now so /reset-tenant
+        # enforces the same rules.
+        success, msg = _drop_site_now(site_name)
+        if not success:
+            # Rough status mapping; _drop_site_now emits messages we classify here
+            if msg.startswith("Cannot drop") or msg.startswith("Invalid"):
+                status = 400 if msg.startswith("Invalid") else 403
+            elif "Another site operation" in msg:
+                status = 503
+            else:
+                status = 500
+            self._send_json(status, {"success": False, "error": msg})
+            return
+
+        self._send_json(200, {
+            "success": True,
+            "site_name": site_name,
+            "message": msg,
+            "already_dropped": "does not exist" in msg,
+        })
+
+    def _handle_reset_tenant(self) -> None:
+        """Atomic drop-then-claim for import-abandon flow.
+
+        Always attempts the drop (safe + idempotent). If the warm pool has a
+        site, performs an instant claim of a fresh one. If the pool is empty
+        after the drop, returns 503 with ``pool_empty=True`` so the caller can
+        show a blocking "Preparing fresh workspace…" UI while replenishment
+        runs in the background.
+        """
+        body = self._read_body()
+        tenant_name = body.get("tenant_name", "").strip()
+        if not tenant_name:
+            # Accept `site_name` alias for symmetry with /drop-site
+            tenant_name = body.get("site_name", "").strip()
+        if not tenant_name:
+            self._send_json(400, {
+                "success": False,
+                "error": "tenant_name (or site_name) is required",
+            })
+            return
+
+        if ".." in tenant_name or "/" in tenant_name or "\\" in tenant_name:
+            self._send_json(400, {"success": False, "error": "Invalid tenant_name"})
+            return
+        if tenant_name == DEFAULT_SITE:
             self._send_json(403, {
                 "success": False,
-                "error": f"Cannot drop the default site '{DEFAULT_SITE}'",
+                "error": f"Cannot reset the default site '{DEFAULT_SITE}'",
             })
             return
 
-        # Safety: reject dangerous names
-        if ".." in site_name or "/" in site_name or "\\" in site_name:
-            self._send_json(400, {"success": False, "error": "Invalid site_name"})
-            return
-
-        # Check if site exists
-        site_dir = SITES_DIR / site_name
-        if not site_dir.exists():
-            self._send_json(200, {
-                "success": True,
-                "already_dropped": True,
-                "message": f"Site {site_name} does not exist (already dropped)",
+        # Step 1: drop the dirty site (idempotent if already gone)
+        drop_ok, drop_msg = _drop_site_now(tenant_name)
+        if not drop_ok:
+            status = 503 if "Another site operation" in drop_msg else 500
+            self._send_json(status, {
+                "success": False,
+                "phase": "drop",
+                "error": drop_msg,
             })
             return
 
-        if not _bench_lock.acquire(timeout=5):
+        # Step 2: claim a fresh pool site under the same name
+        pool = _get_pool_sites()
+        if not pool:
+            # Kick off replenishment so the caller's next attempt succeeds,
+            # then return 503 so the frontend shows the blocking UI.
+            _replenish_pool_background()
+            _check_pool_health()
             self._send_json(503, {
                 "success": False,
-                "error": "Another site operation is in progress. Try again in a moment.",
+                "phase": "claim",
+                "pool_empty": True,
+                "drop_message": drop_msg,
+                "error": (
+                    "Warm pool is empty after drop. Replenishment triggered; "
+                    "retry /claim-site or /reset-tenant in ~3 min."
+                ),
             })
             return
 
-        try:
-            success, output = _run_bench([
-                "drop-site",
-                site_name,
-                "--force",
-                "--db-root-username", "root",
-                "--db-root-password", MARIADB_ROOT_PASSWORD,
-            ], timeout=120)
+        pool_site = pool[0]
+        claim_ok, claim_msg = _rename_site(pool_site, tenant_name)
+        if not claim_ok:
+            self._send_json(500, {
+                "success": False,
+                "phase": "claim",
+                "drop_message": drop_msg,
+                "error": claim_msg,
+            })
+            return
 
-            if success:
-                self._send_json(200, {
-                    "success": True,
-                    "site_name": site_name,
-                    "message": "Site dropped successfully",
-                })
-            else:
-                # Check if it's actually gone despite error
-                if not site_dir.exists():
-                    self._send_json(200, {
-                        "success": True,
-                        "site_name": site_name,
-                        "message": "Site dropped (with warnings)",
-                    })
-                else:
-                    self._send_json(500, {
-                        "success": False,
-                        "error": f"bench drop-site failed: {output[-300:]}",
-                    })
-        finally:
-            _bench_lock.release()
+        logger.info("Reset tenant: dropped + claimed %s (from %s)", tenant_name, pool_site)
+        _replenish_pool_background()
+        _check_pool_health()
+        self._send_json(200, {
+            "success": True,
+            "site_name": tenant_name,
+            "claimed_from": pool_site,
+            "message": "Tenant site reset — fresh workspace claimed from pool",
+        })
 
     def log_message(self, format: str, *args: object) -> None:
         """Override to use our logger instead of stderr."""
