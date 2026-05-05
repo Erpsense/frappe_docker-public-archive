@@ -61,8 +61,22 @@ DEFAULT_ADMIN_PASSWORD = os.environ.get("DEFAULT_ADMIN_PASSWORD", "Admin@2026")
 POOL_LOW_WARN_SECONDS = int(os.environ.get("POOL_LOW_WARN_SECONDS", "60"))
 SITES_DIR = Path("/home/frappe/frappe-bench/sites")
 
-# Lock to prevent concurrent bench operations (bench is not concurrency-safe)
-_bench_lock = threading.Lock()
+# Lock to prevent concurrent bench operations (bench is not concurrency-safe).
+#
+# PHASE3-Issue-3 — split into separate locks for new-site (slow, 3-5
+# minutes for warm-pool replenishment) and drop-site (cheap, seconds).
+# Holding one lock for both used to block fast `/drop-site` and
+# `/reset-tenant` requests behind a background pool replenisher,
+# returning 503 to QA seed-iteration scripts. The two operations
+# don't conflict at the bench level when they target different sites
+# (which is always the case here — drop targets an existing tenant
+# site, new-site targets a fresh `_pool-N.localhost`).
+#
+# `_bench_lock` is kept as an alias for any callers we missed; new
+# code should use the specific lock.
+_bench_new_site_lock = threading.Lock()
+_bench_drop_site_lock = threading.Lock()
+_bench_lock = _bench_new_site_lock  # back-compat alias
 
 # Timestamp when pool first observed as empty; reset to None when pool becomes
 # non-empty. Used by the pool-health monitor to emit a single WARN per sustained
@@ -210,8 +224,10 @@ def _replenish_pool_sync() -> None:
             break
 
         name = _next_pool_name()
-        if not _bench_lock.acquire(timeout=5):
-            logger.warning("bench lock busy, skipping pool replenish")
+        # PHASE3-Issue-3 — use the new-site-specific lock so this
+        # 3-5 minute operation doesn't block fast /drop-site requests.
+        if not _bench_new_site_lock.acquire(timeout=5):
+            logger.warning("bench new-site lock busy, skipping pool replenish")
             break
 
         try:
@@ -232,13 +248,34 @@ def _replenish_pool_sync() -> None:
             else:
                 logger.error("Failed to create pool site %s: %s", name, output[-200:])
         finally:
-            _bench_lock.release()
+            _bench_new_site_lock.release()
 
 
 def _replenish_pool_background() -> None:
     """Start pool replenishment in a background thread."""
     thread = threading.Thread(target=_replenish_pool_sync, daemon=True)
     thread.start()
+
+
+def _claimed_site_is_healthy(site_name: str) -> tuple[bool, str]:
+    """PHASE3-Issue-4 — post-claim health check.
+
+    Warm-pool occasionally ships half-baked sites (e.g. interrupted
+    `bench new-site` left the DB partially seeded; first login then dies
+    with `DocType System Settings not found`). Run a cheap
+    `bench --site <S> list-apps` after the rename so the API caller can
+    distinguish "site claimed cleanly" from "site claimed but corrupt"
+    and retry without manual intervention. Returns (healthy, message).
+    """
+    success, output = _run_bench(["--site", site_name, "list-apps"], timeout=30)
+    if not success:
+        return False, f"list-apps failed: {output[-200:]}"
+    # bench list-apps prints app names one per line; a healthy site has
+    # at least `frappe` and (for pool sites) `erpnext`.
+    out_lower = output.lower()
+    if "frappe" not in out_lower:
+        return False, f"list-apps output missing frappe: {output[-200:]}"
+    return True, "site healthy"
 
 
 def _drop_site_now(site_name: str) -> tuple[bool, str]:
@@ -257,8 +294,14 @@ def _drop_site_now(site_name: str) -> tuple[bool, str]:
         # Already dropped — idempotent success
         return True, f"Site {site_name} does not exist (already dropped)"
 
-    if not _bench_lock.acquire(timeout=5):
-        return False, "Another site operation is in progress"
+    # PHASE3-Issue-3 — drop-site uses its own lock so it doesn't queue
+    # behind a 3-5 minute pool replenisher (`bench new-site`). Bench is
+    # not concurrency-safe for the SAME operation, but new-site and
+    # drop-site target different sites and don't conflict at the bench
+    # level — so giving each its own lock is safe and unblocks
+    # /drop-site + /reset-tenant during pool replenishment.
+    if not _bench_drop_site_lock.acquire(timeout=5):
+        return False, "Another drop-site operation is in progress"
 
     try:
         success, output = _run_bench([
@@ -275,7 +318,7 @@ def _drop_site_now(site_name: str) -> tuple[bool, str]:
             return True, f"Site {site_name} dropped (with warnings)"
         return False, f"bench drop-site failed: {output[-300:]}"
     finally:
-        _bench_lock.release()
+        _bench_drop_site_lock.release()
 
 
 def _check_pool_health() -> None:
@@ -524,18 +567,45 @@ class ProvisionerHandler(BaseHTTPRequestHandler):
         # Claim the first available pool site
         pool_site = pool[0]
         success, msg = _rename_site(pool_site, target_name)
-        if success:
-            logger.info("Claimed pool site: %s → %s", pool_site, target_name)
-            # Trigger background replenishment
-            _replenish_pool_background()
-            self._send_json(200, {
-                "success": True,
-                "site_name": target_name,
-                "claimed_from": pool_site,
-                "message": "Site claimed from warm pool (instant)",
-            })
-        else:
+        if not success:
             self._send_json(500, {"success": False, "error": msg})
+            return
+
+        # PHASE3-Issue-4 — post-claim health check. The warm pool
+        # occasionally ships half-baked sites (e.g. an interrupted
+        # `bench new-site` left the DB partially seeded). Verify the
+        # claimed site responds to a basic bench query before returning
+        # success — if it doesn't, drop it so the operator's next claim
+        # picks a different pool member, and surface a 503 so the
+        # caller can retry.
+        healthy, health_msg = _claimed_site_is_healthy(target_name)
+        if not healthy:
+            logger.warning(
+                "Claimed pool site %s failed health check, dropping: %s",
+                target_name, health_msg,
+            )
+            _drop_site_now(target_name)
+            _replenish_pool_background()
+            self._send_json(503, {
+                "success": False,
+                "error": (
+                    f"Claimed site failed post-claim health check: {health_msg}. "
+                    "Bad site dropped. Retry to claim a different pool member."
+                ),
+                "claimed_from": pool_site,
+                "retryable": True,
+            })
+            return
+
+        logger.info("Claimed pool site: %s → %s", pool_site, target_name)
+        # Trigger background replenishment
+        _replenish_pool_background()
+        self._send_json(200, {
+            "success": True,
+            "site_name": target_name,
+            "claimed_from": pool_site,
+            "message": "Site claimed from warm pool (instant)",
+        })
 
     def _handle_drop_site(self) -> None:
         body = self._read_body()
