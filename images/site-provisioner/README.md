@@ -24,11 +24,11 @@ tag pinning.
 
 Automated by `.github/workflows/build-publish-provisioner.yml`:
 
-| Trigger | Tags published |
-|---|---|
-| Push to `main` | `:main`, `:sha-<short>` |
-| Tag `v*` | `:<version>`, `:latest`, `:sha-<short>` |
-| `workflow_dispatch` | `:manual-<short>`, `:sha-<short>` |
+| Trigger             | Tags published                          |
+| ------------------- | --------------------------------------- |
+| Push to `main`      | `:main`, `:sha-<short>`                 |
+| Tag `v*`            | `:<version>`, `:latest`, `:sha-<short>` |
+| `workflow_dispatch` | `:manual-<short>`, `:sha-<short>`       |
 
 Images are pushed to Artifact Registry per environment:
 `asia-south1-docker.pkg.dev/erpsense-<env>/docker/frappe-multisite-provisioner:<tag>`
@@ -50,6 +50,7 @@ rollouts are explicit operator actions per environment.
 ```
 
 The script:
+
 1. Verifies the image exists in Artifact Registry
 2. SSHs into the env's VM via IAP
 3. Pulls the new image

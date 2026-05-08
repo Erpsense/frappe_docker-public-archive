@@ -14,17 +14,17 @@ name: Build & publish multisite-provisioner image
 "on":
   push:
     branches: [main]
-    tags: ['v*']
+    tags: ["v*"]
     paths:
-      - 'site_provisioner.py'
-      - 'multisite-nginx.conf.template'
-      - 'images/site-provisioner/**'
-      - '.github/workflows/build-publish-provisioner.yml'
+      - "site_provisioner.py"
+      - "multisite-nginx.conf.template"
+      - "images/site-provisioner/**"
+      - ".github/workflows/build-publish-provisioner.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
-  id-token: write   # Required for GCP Workload Identity Federation
+  id-token: write # Required for GCP Workload Identity Federation
 
 env:
   GAR_REGION: asia-south1
@@ -60,7 +60,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        env: [dev]   # add stage/prod once their AR repos exist
+        env: [dev] # add stage/prod once their AR repos exist
     steps:
       - uses: actions/checkout@v4
 
@@ -106,7 +106,7 @@ jobs:
           tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          provenance: false   # Frappe base images don't sign provenance attestations
+          provenance: false # Frappe base images don't sign provenance attestations
 
       - name: Smoke-test image
         run: |

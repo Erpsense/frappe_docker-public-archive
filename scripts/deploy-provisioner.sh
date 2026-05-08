@@ -35,10 +35,25 @@ if [[ -z "$ENV" || -z "$TAG" ]]; then
 fi
 
 case "$ENV" in
-  dev)   PROJECT=erpsense-dev;   ZONE=asia-south1-c; VM=erpnext-vm-dev ;;
-  stage) PROJECT=erpsense-stage; ZONE=asia-south1-c; VM=erpnext-vm-stage ;;
-  prod)  PROJECT=erpsense-prod;  ZONE=asia-south1-c; VM=erpnext-vm-prod ;;
-  *)     echo "Unknown env: $ENV" >&2; exit 1 ;;
+dev)
+  PROJECT=erpsense-dev
+  ZONE=asia-south1-c
+  VM=erpnext-vm-dev
+  ;;
+stage)
+  PROJECT=erpsense-stage
+  ZONE=asia-south1-c
+  VM=erpnext-vm-stage
+  ;;
+prod)
+  PROJECT=erpsense-prod
+  ZONE=asia-south1-c
+  VM=erpnext-vm-prod
+  ;;
+*)
+  echo "Unknown env: $ENV" >&2
+  exit 1
+  ;;
 esac
 
 REGION=asia-south1
