@@ -11,16 +11,15 @@ name: Build & publish multisite-provisioner image
 #     dev/stage/prod from CI; rollouts are operator actions per
 #     environment, intentionally.
 
-on:
+"on":
   push:
     branches: [main]
+    tags: ['v*']
     paths:
       - 'site_provisioner.py'
       - 'multisite-nginx.conf.template'
       - 'images/site-provisioner/**'
       - '.github/workflows/build-publish-provisioner.yml'
-  push:
-    tags: ['v*']
   workflow_dispatch:
 
 permissions:
@@ -33,7 +32,31 @@ env:
   IMAGE_NAME: frappe-multisite-provisioner
 
 jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - id: check
+        env:
+          WIF_DEV: ${{ secrets.WIF_PROVIDER_DEV }}
+        run: |
+          # Gate the build on at least one env having WIF wired up so a
+          # main-push doesn't fail noisily before the operator finishes
+          # the one-time WIF setup. When secrets are present the build
+          # proceeds; until then this run is a green no-op.
+          if [ -n "${WIF_DEV}" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "✓ WIF secrets configured — proceeding to build"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "⚠ Skipping build — WIF secrets not yet configured."
+            echo "  Set WIF_PROVIDER_DEV and CI_SERVICE_ACCOUNT_DEV repo secrets to enable."
+          fi
+
   build:
+    needs: preflight
+    if: needs.preflight.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     strategy:
       matrix:
