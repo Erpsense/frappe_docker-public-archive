@@ -107,8 +107,16 @@ def _get_all_sites() -> list[str]:
     """List all Frappe sites excluding the default site and special files."""
     if not SITES_DIR.exists():
         return []
-    exclude = {DEFAULT_SITE, "common_site_config.json", "apps.txt", "apps.json",
-               "assets", ".DS_Store", "logs", "site_provisioner.py"}
+    exclude = {
+        DEFAULT_SITE,
+        "common_site_config.json",
+        "apps.txt",
+        "apps.json",
+        "assets",
+        ".DS_Store",
+        "logs",
+        "site_provisioner.py",
+    }
     return sorted(
         entry.name
         for entry in SITES_DIR.iterdir()
@@ -178,7 +186,9 @@ def _fix_db_password(site_name: str) -> None:
         if result.returncode == 0:
             logger.info("Fixed DB password for site %s (db=%s)", site_name, db_name)
         else:
-            logger.warning("Failed to fix DB password for %s: %s", site_name, result.stderr[:200])
+            logger.warning(
+                "Failed to fix DB password for %s: %s", site_name, result.stderr[:200]
+            )
     except Exception as e:
         logger.warning("Error fixing DB password for %s: %s", site_name, e)
 
@@ -213,8 +223,12 @@ def _replenish_pool_sync() -> None:
         logger.info("Pool is full (%d/%d)", len(current_pool), POOL_SIZE)
         return
 
-    logger.info("Replenishing pool: %d sites needed (current: %d/%d)",
-                needed, len(current_pool), POOL_SIZE)
+    logger.info(
+        "Replenishing pool: %d sites needed (current: %d/%d)",
+        needed,
+        len(current_pool),
+        POOL_SIZE,
+    )
 
     for _ in range(needed):
         # Check max total sites limit
@@ -232,16 +246,26 @@ def _replenish_pool_sync() -> None:
 
         try:
             import uuid as _uuid
+
             unique_db = f"_p{_uuid.uuid4().hex[:16]}"
-            success, output = _run_bench([
-                "new-site", name,
-                "--mariadb-user-host-login-scope=%",
-                "--admin-password", DEFAULT_ADMIN_PASSWORD,
-                "--db-root-username", "root",
-                "--db-root-password", MARIADB_ROOT_PASSWORD,
-                "--db-name", unique_db,
-                "--install-app", "erpnext",
-            ], timeout=300)
+            success, output = _run_bench(
+                [
+                    "new-site",
+                    name,
+                    "--mariadb-user-host-login-scope=%",
+                    "--admin-password",
+                    DEFAULT_ADMIN_PASSWORD,
+                    "--db-root-username",
+                    "root",
+                    "--db-root-password",
+                    MARIADB_ROOT_PASSWORD,
+                    "--db-name",
+                    unique_db,
+                    "--install-app",
+                    "erpnext",
+                ],
+                timeout=300,
+            )
             if success:
                 _fix_db_password(name)  # Ensure DB user password matches config
                 logger.info("Pool site created: %s", name)
@@ -304,13 +328,18 @@ def _drop_site_now(site_name: str) -> tuple[bool, str]:
         return False, "Another drop-site operation is in progress"
 
     try:
-        success, output = _run_bench([
-            "drop-site",
-            site_name,
-            "--force",
-            "--db-root-username", "root",
-            "--db-root-password", MARIADB_ROOT_PASSWORD,
-        ], timeout=120)
+        success, output = _run_bench(
+            [
+                "drop-site",
+                site_name,
+                "--force",
+                "--db-root-username",
+                "root",
+                "--db-root-password",
+                MARIADB_ROOT_PASSWORD,
+            ],
+            timeout=120,
+        )
         if success:
             return True, f"Site {site_name} dropped"
         # Site may be gone despite non-zero exit
@@ -346,7 +375,8 @@ def _check_pool_health() -> None:
             logger.warning(
                 "Warm pool empty for %.0fs (threshold=%ds). "
                 "Next claim will block until replenishment completes.",
-                elapsed, POOL_LOW_WARN_SECONDS,
+                elapsed,
+                POOL_LOW_WARN_SECONDS,
             )
             # Reset so the next warning fires after another full threshold,
             # not every poll.
@@ -398,33 +428,42 @@ class ProvisionerHandler(BaseHTTPRequestHandler):
             pool = _get_pool_sites()
             tenants = _get_tenant_sites()
             _check_pool_health()
-            self._send_json(200, {
-                "success": True,
-                "status": "healthy",
-                "max_sites": MAX_SITES,
-                "current_sites": len(tenants),
-                "pool_size": len(pool),
-                "pool_target": POOL_SIZE,
-            })
+            self._send_json(
+                200,
+                {
+                    "success": True,
+                    "status": "healthy",
+                    "max_sites": MAX_SITES,
+                    "current_sites": len(tenants),
+                    "pool_size": len(pool),
+                    "pool_target": POOL_SIZE,
+                },
+            )
         elif self.path == "/list-sites":
             sites = _get_tenant_sites()
-            self._send_json(200, {
-                "success": True,
-                "sites": sites,
-                "count": len(sites),
-                "max_sites": MAX_SITES,
-                "remaining": max(0, MAX_SITES - len(sites)),
-            })
+            self._send_json(
+                200,
+                {
+                    "success": True,
+                    "sites": sites,
+                    "count": len(sites),
+                    "max_sites": MAX_SITES,
+                    "remaining": max(0, MAX_SITES - len(sites)),
+                },
+            )
         elif self.path == "/pool-status":
             pool = _get_pool_sites()
             _check_pool_health()
-            self._send_json(200, {
-                "success": True,
-                "pool_sites": pool,
-                "available": len(pool),
-                "target": POOL_SIZE,
-                "ready": len(pool) > 0,
-            })
+            self._send_json(
+                200,
+                {
+                    "success": True,
+                    "pool_sites": pool,
+                    "available": len(pool),
+                    "target": POOL_SIZE,
+                    "ready": len(pool) > 0,
+                },
+            )
         else:
             self._send_json(404, {"success": False, "error": "Not found"})
 
@@ -457,68 +496,93 @@ class ProvisionerHandler(BaseHTTPRequestHandler):
         # Check if site already exists
         site_dir = SITES_DIR / site_name
         if site_dir.exists() and (site_dir / "site_config.json").exists():
-            self._send_json(200, {
-                "success": True,
-                "already_exists": True,
-                "site_name": site_name,
-                "message": "Site already exists",
-            })
+            self._send_json(
+                200,
+                {
+                    "success": True,
+                    "already_exists": True,
+                    "site_name": site_name,
+                    "message": "Site already exists",
+                },
+            )
             return
 
         # Enforce max sites limit
         current_sites = _get_tenant_sites()
         if len(current_sites) >= MAX_SITES:
-            self._send_json(429, {
-                "success": False,
-                "error": (
-                    f"Maximum site limit reached ({MAX_SITES}). "
-                    f"Delete an existing tenant before creating a new one. "
-                    f"Current sites: {', '.join(current_sites)}"
-                ),
-                "current_sites": len(current_sites),
-                "max_sites": MAX_SITES,
-            })
+            self._send_json(
+                429,
+                {
+                    "success": False,
+                    "error": (
+                        f"Maximum site limit reached ({MAX_SITES}). "
+                        f"Delete an existing tenant before creating a new one. "
+                        f"Current sites: {', '.join(current_sites)}"
+                    ),
+                    "current_sites": len(current_sites),
+                    "max_sites": MAX_SITES,
+                },
+            )
             return
 
         # Acquire lock — bench is not concurrency-safe
         if not _bench_lock.acquire(timeout=5):
-            self._send_json(503, {
-                "success": False,
-                "error": "Another site operation is in progress. Try again in a moment.",
-            })
+            self._send_json(
+                503,
+                {
+                    "success": False,
+                    "error": "Another site operation is in progress. Try again in a moment.",
+                },
+            )
             return
 
         try:
-            success, output = _run_bench([
-                "new-site",
-                site_name,
-                "--mariadb-user-host-login-scope=%",
-                "--admin-password", admin_password,
-                "--db-root-username", "root",
-                "--db-root-password", MARIADB_ROOT_PASSWORD,
-                "--install-app", "erpnext",
-            ], timeout=300)
+            success, output = _run_bench(
+                [
+                    "new-site",
+                    site_name,
+                    "--mariadb-user-host-login-scope=%",
+                    "--admin-password",
+                    admin_password,
+                    "--db-root-username",
+                    "root",
+                    "--db-root-password",
+                    MARIADB_ROOT_PASSWORD,
+                    "--install-app",
+                    "erpnext",
+                ],
+                timeout=300,
+            )
 
             if success:
-                self._send_json(201, {
-                    "success": True,
-                    "site_name": site_name,
-                    "message": "Site created successfully",
-                })
+                self._send_json(
+                    201,
+                    {
+                        "success": True,
+                        "site_name": site_name,
+                        "message": "Site created successfully",
+                    },
+                )
             else:
                 # Check if it actually got created despite error output
                 if (site_dir / "site_config.json").exists():
-                    self._send_json(201, {
-                        "success": True,
-                        "site_name": site_name,
-                        "message": "Site created (with warnings)",
-                        "warnings": output[-200:],
-                    })
+                    self._send_json(
+                        201,
+                        {
+                            "success": True,
+                            "site_name": site_name,
+                            "message": "Site created (with warnings)",
+                            "warnings": output[-200:],
+                        },
+                    )
                 else:
-                    self._send_json(500, {
-                        "success": False,
-                        "error": f"bench new-site failed: {output[-300:]}",
-                    })
+                    self._send_json(
+                        500,
+                        {
+                            "success": False,
+                            "error": f"bench new-site failed: {output[-300:]}",
+                        },
+                    )
         finally:
             _bench_lock.release()
 
@@ -537,31 +601,40 @@ class ProvisionerHandler(BaseHTTPRequestHandler):
 
         # Check if target already exists
         if (SITES_DIR / target_name).exists():
-            self._send_json(200, {
-                "success": True,
-                "already_exists": True,
-                "site_name": target_name,
-            })
+            self._send_json(
+                200,
+                {
+                    "success": True,
+                    "already_exists": True,
+                    "site_name": target_name,
+                },
+            )
             return
 
         # Check tenant limit
         tenants = _get_tenant_sites()
         if len(tenants) >= MAX_SITES:
-            self._send_json(429, {
-                "success": False,
-                "error": f"Maximum tenant limit reached ({MAX_SITES}). Delete a tenant first.",
-            })
+            self._send_json(
+                429,
+                {
+                    "success": False,
+                    "error": f"Maximum tenant limit reached ({MAX_SITES}). Delete a tenant first.",
+                },
+            )
             return
 
         # Find an available pool site
         pool = _get_pool_sites()
         if not pool:
             # No warm sites — fall back to create-site
-            self._send_json(503, {
-                "success": False,
-                "error": "No warm sites available in pool. Use /create-site as fallback.",
-                "pool_empty": True,
-            })
+            self._send_json(
+                503,
+                {
+                    "success": False,
+                    "error": "No warm sites available in pool. Use /create-site as fallback.",
+                    "pool_empty": True,
+                },
+            )
             return
 
         # Claim the first available pool site
@@ -582,30 +655,37 @@ class ProvisionerHandler(BaseHTTPRequestHandler):
         if not healthy:
             logger.warning(
                 "Claimed pool site %s failed health check, dropping: %s",
-                target_name, health_msg,
+                target_name,
+                health_msg,
             )
             _drop_site_now(target_name)
             _replenish_pool_background()
-            self._send_json(503, {
-                "success": False,
-                "error": (
-                    f"Claimed site failed post-claim health check: {health_msg}. "
-                    "Bad site dropped. Retry to claim a different pool member."
-                ),
-                "claimed_from": pool_site,
-                "retryable": True,
-            })
+            self._send_json(
+                503,
+                {
+                    "success": False,
+                    "error": (
+                        f"Claimed site failed post-claim health check: {health_msg}. "
+                        "Bad site dropped. Retry to claim a different pool member."
+                    ),
+                    "claimed_from": pool_site,
+                    "retryable": True,
+                },
+            )
             return
 
         logger.info("Claimed pool site: %s → %s", pool_site, target_name)
         # Trigger background replenishment
         _replenish_pool_background()
-        self._send_json(200, {
-            "success": True,
-            "site_name": target_name,
-            "claimed_from": pool_site,
-            "message": "Site claimed from warm pool (instant)",
-        })
+        self._send_json(
+            200,
+            {
+                "success": True,
+                "site_name": target_name,
+                "claimed_from": pool_site,
+                "message": "Site claimed from warm pool (instant)",
+            },
+        )
 
     def _handle_drop_site(self) -> None:
         body = self._read_body()
@@ -629,12 +709,15 @@ class ProvisionerHandler(BaseHTTPRequestHandler):
             self._send_json(status, {"success": False, "error": msg})
             return
 
-        self._send_json(200, {
-            "success": True,
-            "site_name": site_name,
-            "message": msg,
-            "already_dropped": "does not exist" in msg,
-        })
+        self._send_json(
+            200,
+            {
+                "success": True,
+                "site_name": site_name,
+                "message": msg,
+                "already_dropped": "does not exist" in msg,
+            },
+        )
 
     def _handle_reset_tenant(self) -> None:
         """Atomic drop-then-claim for import-abandon flow.
@@ -651,31 +734,40 @@ class ProvisionerHandler(BaseHTTPRequestHandler):
             # Accept `site_name` alias for symmetry with /drop-site
             tenant_name = body.get("site_name", "").strip()
         if not tenant_name:
-            self._send_json(400, {
-                "success": False,
-                "error": "tenant_name (or site_name) is required",
-            })
+            self._send_json(
+                400,
+                {
+                    "success": False,
+                    "error": "tenant_name (or site_name) is required",
+                },
+            )
             return
 
         if ".." in tenant_name or "/" in tenant_name or "\\" in tenant_name:
             self._send_json(400, {"success": False, "error": "Invalid tenant_name"})
             return
         if tenant_name == DEFAULT_SITE:
-            self._send_json(403, {
-                "success": False,
-                "error": f"Cannot reset the default site '{DEFAULT_SITE}'",
-            })
+            self._send_json(
+                403,
+                {
+                    "success": False,
+                    "error": f"Cannot reset the default site '{DEFAULT_SITE}'",
+                },
+            )
             return
 
         # Step 1: drop the dirty site (idempotent if already gone)
         drop_ok, drop_msg = _drop_site_now(tenant_name)
         if not drop_ok:
             status = 503 if "Another site operation" in drop_msg else 500
-            self._send_json(status, {
-                "success": False,
-                "phase": "drop",
-                "error": drop_msg,
-            })
+            self._send_json(
+                status,
+                {
+                    "success": False,
+                    "phase": "drop",
+                    "error": drop_msg,
+                },
+            )
             return
 
         # Step 2: claim a fresh pool site under the same name
@@ -685,38 +777,49 @@ class ProvisionerHandler(BaseHTTPRequestHandler):
             # then return 503 so the frontend shows the blocking UI.
             _replenish_pool_background()
             _check_pool_health()
-            self._send_json(503, {
-                "success": False,
-                "phase": "claim",
-                "pool_empty": True,
-                "drop_message": drop_msg,
-                "error": (
-                    "Warm pool is empty after drop. Replenishment triggered; "
-                    "retry /claim-site or /reset-tenant in ~3 min."
-                ),
-            })
+            self._send_json(
+                503,
+                {
+                    "success": False,
+                    "phase": "claim",
+                    "pool_empty": True,
+                    "drop_message": drop_msg,
+                    "error": (
+                        "Warm pool is empty after drop. Replenishment triggered; "
+                        "retry /claim-site or /reset-tenant in ~3 min."
+                    ),
+                },
+            )
             return
 
         pool_site = pool[0]
         claim_ok, claim_msg = _rename_site(pool_site, tenant_name)
         if not claim_ok:
-            self._send_json(500, {
-                "success": False,
-                "phase": "claim",
-                "drop_message": drop_msg,
-                "error": claim_msg,
-            })
+            self._send_json(
+                500,
+                {
+                    "success": False,
+                    "phase": "claim",
+                    "drop_message": drop_msg,
+                    "error": claim_msg,
+                },
+            )
             return
 
-        logger.info("Reset tenant: dropped + claimed %s (from %s)", tenant_name, pool_site)
+        logger.info(
+            "Reset tenant: dropped + claimed %s (from %s)", tenant_name, pool_site
+        )
         _replenish_pool_background()
         _check_pool_health()
-        self._send_json(200, {
-            "success": True,
-            "site_name": tenant_name,
-            "claimed_from": pool_site,
-            "message": "Tenant site reset — fresh workspace claimed from pool",
-        })
+        self._send_json(
+            200,
+            {
+                "success": True,
+                "site_name": tenant_name,
+                "claimed_from": pool_site,
+                "message": "Tenant site reset — fresh workspace claimed from pool",
+            },
+        )
 
     def log_message(self, format: str, *args: object) -> None:
         """Override to use our logger instead of stderr."""
@@ -728,7 +831,10 @@ def main() -> None:
     pool = _get_pool_sites()
     logger.info(
         "Site provisioner started on port %d (max_sites=%d, pool=%d/%d)",
-        PORT, MAX_SITES, len(pool), POOL_SIZE,
+        PORT,
+        MAX_SITES,
+        len(pool),
+        POOL_SIZE,
     )
 
     # Fix DB passwords for all existing sites on startup
