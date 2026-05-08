@@ -1,0 +1,93 @@
+name: Build & publish multisite-provisioner image
+
+# When this fires
+#   - push to main: build + push as :main + :sha-<short>
+#   - tag v*: build + push as :<tag> + :latest
+#   - workflow_dispatch: build + push as :manual-<sha>
+#
+# What it does NOT do
+#   - SSH into the VM. Image rollouts on the VM are explicit (see
+#     scripts/deploy-provisioner-to-dev.sh). We do not auto-rollout to
+#     dev/stage/prod from CI; rollouts are operator actions per
+#     environment, intentionally.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'site_provisioner.py'
+      - 'multisite-nginx.conf.template'
+      - 'images/site-provisioner/**'
+      - '.github/workflows/build-publish-provisioner.yml'
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # Required for GCP Workload Identity Federation
+
+env:
+  GAR_REGION: asia-south1
+  GAR_REPO: docker
+  IMAGE_NAME: frappe-multisite-provisioner
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        env: [dev]   # add stage/prod once their AR repos exist
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP via Workload Identity Federation
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets[format('WIF_PROVIDER_{0}', matrix.env)] }}
+          service_account: ${{ secrets[format('CI_SERVICE_ACCOUNT_{0}', matrix.env)] }}
+
+      - name: Configure Docker auth for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.GAR_REGION }}-docker.pkg.dev --quiet
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          PROJECT="erpsense-${{ matrix.env }}"
+          BASE="${{ env.GAR_REGION }}-docker.pkg.dev/${PROJECT}/${{ env.GAR_REPO }}/${{ env.IMAGE_NAME }}"
+          TAGS="${BASE}:sha-${SHORT_SHA}"
+          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            TAGS="${TAGS},${BASE}:main"
+          fi
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+            TAGS="${TAGS},${BASE}:${VERSION},${BASE}:latest"
+          fi
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            TAGS="${TAGS},${BASE}:manual-${SHORT_SHA}"
+          fi
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "Will publish: ${TAGS}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: images/site-provisioner/Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false   # Frappe base images don't sign provenance attestations
+
+      - name: Smoke-test image
+        run: |
+          IMAGE_TAG="$(echo "${{ steps.tags.outputs.tags }}" | cut -d',' -f1)"
+          # Smoke-test that the entrypoint at least loads the script
+          docker run --rm --entrypoint python3 "$IMAGE_TAG" -c \
+            "import ast; ast.parse(open('/opt/erpsense/site_provisioner.py').read()); print('OK')"
